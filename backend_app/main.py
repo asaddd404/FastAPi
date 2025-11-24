@@ -1,34 +1,42 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional
-
-# --- Важно для фронтенда! ---
+# main.py
+from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict
+from passlib.context import CryptContext
+from datetime import datetime, timedelta
+import jwt
 
-app = FastAPI()
-
-# --- Настройка CORS ---
-# Это позволит твоему другу (фронтенду) делать запросы к твоему API
-# со своего компьютера (localhost)
-origins = [
-    "http://localhost",
-    "http://localhost:8080", # Стандартный порт для Vue/React
-    "http://localhost:3000", # Другой стандартный порт
-    "http://127.0.0.1:5500", # Для Live Server в VS Code (если он просто html)
-    # Добавь сюда адрес, с которого будет работать твой друг, если он другой
-]
+app = FastAPI(title="Мой магазин", version="1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins, # Разрешаем эти источники
+    allow_origins=["*"],    
     allow_credentials=True,
-    allow_methods=["*"], # Разрешаем все методы (GET, POST и т.д.)
-    allow_headers=["*"], # Разрешаем все заголовки
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
+# === JWT ===
+SECRET_KEY = "change-me-in-production-2025"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
-# --- Модели данных (Pydantic) ---
-# Так FastAPI будет проверять, что данные в запросе правильные
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login", auto_error=False)  # ← ВОТ ЭТО ГЛАВНОЕ!
+
+# === Модели с ПРИМЕРАМИ (чтобы не было "string") ===
+class UserCreate(BaseModel):
+    username: str = Field(..., example="alex")
+    password: str = Field(..., example="123456")
+
+class UserOut(BaseModel):
+    username: str = Field(..., example="alex")
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
 
 class Category(BaseModel):
     id: int
@@ -38,15 +46,20 @@ class Product(BaseModel):
     id: int
     name: str
     price: float
-    category_id: int # Связь с категорией
+    category_id: int
 
-class CartItem(BaseModel): # Модель для добавления в корзину
-    product_id: int
-    quantity: int
+class CartItem(BaseModel):
+    product_id: int = Field(..., example=1)
+    quantity: int = Field(1, ge=1, example=1)
 
+class CartResponse(BaseModel):
+    cart: Dict[int, int] = {}
+    total_items: int = 0
+    message: str = "Ok"
 
-# --- Наша "База данных" (просто списки) ---
-# Позже ты заменишь это на PostgreSQL, SQLite и т.д.
+# === БД ===
+db_users: Dict[str, str] = {}  # username → hashed_password
+db_carts: Dict[str, Dict[int, int]] = {}
 
 db_categories = [
     Category(id=1, name="Электроника"),
@@ -54,78 +67,82 @@ db_categories = [
 ]
 
 db_products = [
-    Product(id=1, name="Смартфон", price=500.0, category_id=1),
-    Product(id=2, name="Ноутбук", price=1200.0, category_id=1),
-    Product(id=3, name="FastAPI для профи", price=45.0, category_id=2)
+    Product(id=1, name="Смартфон", price=50000, category_id=1),
+    Product(id=2, name="Ноутбук", price=120000, category_id=1),
+    Product(id=3, name="FastAPI для профи", price=2990, category_id=2),
 ]
 
-# Корзина будет словарем: {product_id: quantity}
-db_cart = {}
+# === Утилиты ===
+def create_token(username: str) -> str:
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    return jwt.encode({"sub": username, "exp": expire}, SECRET_KEY, ALGORITHM)
 
+async def get_current_user(token: Optional[str] = Depends(oauth2_scheme)):
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload.get("sub")
+    except:
+        return None
 
-# --- API Эндпоинты (Роуты) ---
+# === Роуты ===
+@app.post("/auth/register", response_model=UserOut)
+async def register(user: UserCreate):
+    if user.username in db_users:
+        raise HTTPException(400, "Username already exists")
+    db_users[user.username] = pwd_context.hash(user.password)
+    return UserOut(username=user.username)
 
-@app.get("/")
-def read_root():
-    return {"message": "Привет! Это бэкенд для FastAPI проекта."}
+@app.post("/auth/login", response_model=Token)
+async def login(form: OAuth2PasswordRequestForm = Depends()):
+    hashed = db_users.get(form.username)
+    if not hashed or not pwd_context.verify(form.password, hashed):
+        raise HTTPException(401, "Incorrect username or password")
+    token = create_token(form.username)
+    return {"access_token": token, "token_type": "bearer"}
 
-# --- Категории ---
+@app.get("/auth/me", response_model=UserOut)
+async def me(username: str = Depends(get_current_user)):
+    if not username:
+        raise HTTPException(401, "Not authenticated")
+    return UserOut(username=username)
+
 @app.get("/categories/", response_model=List[Category])
 def get_categories():
-    """Получить список всех категорий."""
     return db_categories
 
-# --- Продукты ---
 @app.get("/products/", response_model=List[Product])
 def get_products(category_id: Optional[int] = None):
-    """
-    Получить список всех продуктов.
-    Можно фильтровать по category_id, передав его как параметр.
-    Пример: /products/?category_id=1
-    """
     if category_id:
-        # Возвращаем продукты только из этой категории
         return [p for p in db_products if p.category_id == category_id]
-    # Иначе возвращаем все продукты
     return db_products
 
-@app.get("/products/{product_id}", response_model=Product)
-def get_product(product_id: int):
-    """
-    Получить один продукт по его ID.
-    """
-    for p in db_products:
-        if p.id == product_id:
-            return p
-    # Если не нашли, кидаем ошибку 404
-    raise HTTPException(status_code=404, detail="Product not found")
+@app.get("/cart/", response_model=CartResponse)
+async def get_cart(username: str = Depends(get_current_user)):
+    if not username:
+        raise HTTPException(401, "Login required")
+    cart = db_carts.get(username, {})
+    return CartResponse(cart=cart, total_items=sum(cart.values()))
 
-# --- Корзина ---
-@app.get("/cart/")
-def get_cart():
-    """
-    Посмотреть содержимое корзины.
-    Возвращает словарь {product_id: quantity}
-    """
-    return db_cart
-
-@app.post("/cart/add")
-def add_to_cart(item: CartItem):
-    """
-    Добавить товар в корзину.
-    Тело запроса (JSON) должно быть: {"product_id": 1, "quantity": 1}
-    """
-    # 1. Проверяем, есть ли такой продукт
-    product_exists = any(p.id == item.product_id for p in db_products)
-    if not product_exists:
-        raise HTTPException(status_code=404, detail="Product not found, cannot add to cart")
-
-    # 2. Добавляем в корзину
-    if item.product_id in db_cart:
-        # Если товар уже есть, увеличиваем кол-во
-        db_cart[item.product_id] += item.quantity
-    else:
-        # Если нет, добавляем
-        db_cart[item.product_id] = item.quantity
+@app.post("/cart/add", response_model=CartResponse)
+async def add_to_cart(item: CartItem, username: str = Depends(get_current_user)):
+    if not username:
+        raise HTTPException(401, "Login required")
+    if not any(p.id == item.product_id for p in db_products):
+        raise HTTPException(404, "Product not found")
     
-    return {"message": "Product added to cart", "cart_state": db_cart}
+    db_carts.setdefault(username, {})
+    db_carts[username][item.product_id] = db_carts[username].get(item.product_id, 0) + item.quantity
+    
+    return CartResponse(
+        cart=db_carts[username],
+        total_items=sum(db_carts[username].values()),
+        message="Added to cart"
+    )
+
+@app.post("/cart/clear")
+async def clear_cart(username: str = Depends(get_current_user)):
+    if username and username in db_carts:
+        db_carts[username] = {}
+    return {"message": "Cart cleared"}
